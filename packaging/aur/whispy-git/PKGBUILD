@@ -11,6 +11,7 @@ makedepends=('rust' 'cargo' 'git')
 optdepends=('quickshell: dictation pill overlay UI'
             'cmake: build whisper.cpp via whispy-daemon setup'
             'vulkan-headers: build whisper.cpp with Vulkan backend'
+            'spirv-headers: compile SPIR-V shaders for Vulkan backend'
             'wtype: type-mode injection on Wayland'
             'xdotool: type-mode injection and window-class detection on X11'
             'xclip: clipboard paste mode on X11'
