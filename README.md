@@ -104,6 +104,7 @@ Hyprland keybind ──► whispy-client ──(unix socket)──► whispy-dae
 - **whispy-client** — tiny binary called from Hyprland binds (`start` / `stop` / `cancel` / `toggle`).
 - **whisper-server** — whisper.cpp built with the backend `stt.backend` picks: Vulkan (developed on AMD RDNA4, no ROCm) or CPU (OpenBLAS-accelerated when available).
 - **pill UI** — Quickshell layer overlay reading the state file ([`ui/quickshell/`](ui/quickshell/)).
+- **tray UI** — StatusNotifierItem system tray indicator for any desktop panel ([`ui/tray/`](ui/tray/)).
 
 **Two injection modes** (`injection.mode`):
 
@@ -178,6 +179,7 @@ systemd/        whispy-daemon.service (user unit)
 scripts/        benchmark.sh, setup-ydotool.sh
 packaging/aur/  PKGBUILD (whispy) + whispy-git/PKGBUILD
 ui/quickshell/  Quickshell pill overlay (reads state.json)
+ui/tray/        StatusNotifierItem system tray indicator (reads state.json)
 docs/           spike, benchmark, hyprland setup
 ```
 

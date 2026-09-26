@@ -1,0 +1,14 @@
+[Unit]
+Description=whispy tray indicator
+Documentation=https://github.com/Ceereals/whispy
+After=graphical-session.target whispy-daemon.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/whispy-tray
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
