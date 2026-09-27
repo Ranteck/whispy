@@ -24,7 +24,15 @@ The indicator reflects the real-time state published by `whispy-daemon` in `$XDG
 - **Mouse Controls**:
   - **Left Click**: Toggle capture (`whispy-client toggle`).
   - **Middle Click**: Cancel current capture (`whispy-client cancel`).
-  - **Right Click**: Toggle capture (`whispy-client toggle`).
+  - **Right Click**: Open native context menu (`com.canonical.dbusmenu`).
+- **Interactive Context Menu (Right Click)**:
+  - **Live Status Header**: Displays the current daemon activity.
+  - **Start / Stop Dictation**: Toggle capture directly from the menu.
+  - **Cancel Dictation**: Abort the active capture and discard buffered audio.
+  - **Recording History Submenu**: Lists the last 10 transcribed recordings. Clicking any entry copies the full transcript to the clipboard (`wl-copy` / `xclip`) with a toast notification. Includes a shortcut to open the full `transcripts.jsonl` log.
+  - **Edit Configuration**: Quick shortcut to open `~/.config/whispy/config.toml` in your default editor.
+  - **Restart Daemon**: Restart `whispy-daemon.service` with one click.
+  - **Quit**: Stop the tray companion.
 - **Interactive Tooltip**: Hovering over the icon displays the current status and helpful shortcuts.
 
 ---

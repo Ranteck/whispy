@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 whispy-tray: System tray indicator for the whispy dictation daemon.
-Integrates with the freedesktop StatusNotifierItem (SNI) DBus specification
+Integrates with the freedesktop StatusNotifierItem (SNI) and DBusMenu specifications
 (supported by Noctalia, Waybar, KDE Plasma, XFCE, Polybar, etc.).
 
 Monitors $XDG_RUNTIME_DIR/whispy/state.json and dynamically updates
-the tray icon and tooltip based on the current dictation state:
+the tray icon, tooltip, and context menu based on state and transcripts:
   - idle: microphone (ready)
   - recording: ear (listening)
   - transcribing: brain (GPU inference)
@@ -44,6 +44,7 @@ SNI_XML = """
     <property name="IconPixmap" type="a(iiay)" access="read"/>
     <property name="IconThemePath" type="s" access="read"/>
     <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
     <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
     <method name="ContextMenu">
       <arg name="x" type="i" direction="in"/>
@@ -70,6 +71,61 @@ SNI_XML = """
 </node>
 """
 
+DBUSMENU_XML = """
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <method name="GetLayout">
+      <arg name="parent_id" type="i" direction="in"/>
+      <arg name="recursion_depth" type="i" direction="in"/>
+      <arg name="property_names" type="as" direction="in"/>
+      <arg type="u" direction="out"/>
+      <arg type="(ia{sv}av)" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="property_names" type="as" direction="in"/>
+      <arg type="a(ia{sv})" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg type="v" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="event_id" type="s" direction="in"/>
+      <arg name="data" type="v" direction="in"/>
+      <arg name="timestamp" type="u" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg name="events" type="a(isvu)" direction="in"/>
+      <arg type="ai" direction="out"/>
+    </method>
+    <method name="AboutToShow">
+      <arg name="id" type="i" direction="in"/>
+      <arg type="b" direction="out"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg type="ai" direction="out"/>
+      <arg type="ai" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg name="updated_props" type="a(ia{sv})"/>
+      <arg name="removed_props" type="a(ias)"/>
+    </signal>
+    <signal name="LayoutUpdated">
+      <arg name="revision" type="u"/>
+      <arg name="parent" type="i"/>
+    </signal>
+    <property name="IconThemePath" type="as" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="Version" type="u" access="read"/>
+  </interface>
+</node>
+"""
+
 class WhispyTray:
     def __init__(self):
         self.state_file = os.path.join(
@@ -77,8 +133,14 @@ class WhispyTray:
             "whispy",
             "state.json"
         )
+        state_home = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
+        self.transcripts_file = os.path.join(state_home, "whispy", "transcripts.jsonl")
+
         self.current_state = "idle"
         self.conn = None
+        self.menu_revision = 1
+        self.menu_items_map = {}
+        self.root_menu = None
 
         # Resolve icon directory
         self.icon_dir = self.resolve_icon_dir()
@@ -95,6 +157,7 @@ class WhispyTray:
             self.pixmaps[state_key] = self.render_svg_pixmap(path, 24, 24)
 
         self.icon_name, self.tooltip_text = self.get_icon_and_tooltip("idle")
+        self.rebuild_menu_tree()
 
     def resolve_icon_dir(self):
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -176,6 +239,7 @@ class WhispyTray:
         if new_state != self.current_state:
             self.current_state = new_state
             self.icon_name, self.tooltip_text = self.get_icon_and_tooltip(new_state, err_msg)
+            self.rebuild_menu_tree()
             self.emit_signals()
         return True
 
@@ -196,8 +260,16 @@ class WhispyTray:
             "NewToolTip",
             None
         )
+        self.conn.emit_signal(
+            None,
+            "/MenuBar",
+            "com.canonical.dbusmenu",
+            "LayoutUpdated",
+            GLib.Variant("(ui)", (self.menu_revision, 0))
+        )
 
-    def handle_method_call(self, conn, sender, object_path, interface_name, method_name, parameters, invocation):
+    # --- StatusNotifierItem handlers ---
+    def handle_sni_method(self, conn, sender, object_path, interface_name, method_name, parameters, invocation):
         if method_name == "Activate":
             # Left click: toggle dictation
             subprocess.Popen(["whispy-client", "toggle"])
@@ -205,11 +277,11 @@ class WhispyTray:
             # Middle click: cancel dictation
             subprocess.Popen(["whispy-client", "cancel"])
         elif method_name == "ContextMenu":
-            # Right click: toggle dictation
-            subprocess.Popen(["whispy-client", "toggle"])
+            # Right click is handled via DBusMenu over /MenuBar when Menu property is present
+            pass
         invocation.return_value(None)
 
-    def handle_get_property(self, conn, sender, object_path, interface_name, property_name):
+    def handle_sni_property(self, conn, sender, object_path, interface_name, property_name):
         if property_name == "Category":
             return GLib.Variant("s", "ApplicationStatus")
         elif property_name == "Id":
@@ -227,26 +299,360 @@ class WhispyTray:
             return GLib.Variant("s", self.icon_dir)
         elif property_name == "ItemIsMenu":
             return GLib.Variant("b", False)
+        elif property_name == "Menu":
+            return GLib.Variant("o", "/MenuBar")
         elif property_name == "ToolTip":
             return GLib.Variant("(sa(iiay)ss)", ("", [], "Whispy Dictation", self.tooltip_text))
         return None
 
+    # --- History & Clipboard helpers ---
+    def load_recent_transcripts(self, limit=10):
+        if not os.path.isfile(self.transcripts_file):
+            return []
+        items = []
+        try:
+            with open(self.transcripts_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("accepted") and entry.get("text"):
+                            items.append(entry)
+                    except Exception:
+                        continue
+        except Exception as e:
+            sys.stderr.write(f"whispy-tray: error loading transcripts: {e}\n")
+        return items[-limit:][::-1]
+
+    def copy_to_clipboard(self, text):
+        try:
+            # Try wl-copy (Wayland), fallback to xclip (X11)
+            copied = False
+            for copy_tool in [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]:
+                try:
+                    p = subprocess.Popen(copy_tool, stdin=subprocess.PIPE)
+                    p.communicate(input=text.encode("utf-8"))
+                    if p.returncode == 0:
+                        copied = True
+                        break
+                except FileNotFoundError:
+                    continue
+
+            preview = " ".join(text.split())
+            if len(preview) > 55:
+                preview = preview[:52] + "..."
+
+            subprocess.Popen([
+                "notify-send",
+                "-a", "Whispy",
+                "-i", "whispy-idle",
+                "Copied to clipboard",
+                preview
+            ])
+        except Exception as e:
+            sys.stderr.write(f"whispy-tray: copy error: {e}\n")
+
+    # --- DBusMenu Tree Construction ---
+    def rebuild_menu_tree(self):
+        self.menu_revision += 1
+        self.menu_items_map = {}
+
+        state = self.current_state
+        if state == "recording":
+            state_label = "● Recording audio..."
+            toggle_label = "Stop and transcribe"
+        elif state == "transcribing":
+            state_label = "⏳ Transcribing (GPU)..."
+            toggle_label = "Start dictation"
+        elif state == "error":
+            state_label = "⚠️ Status: Error"
+            toggle_label = "Start dictation"
+        else:
+            state_label = "✓ Ready to dictate"
+            toggle_label = "Start dictation"
+
+        root_children = []
+
+        # 1. State Header (disabled)
+        root_children.append({
+            "id": 1,
+            "props": {
+                "label": GLib.Variant("s", f"Whispy: {state_label}"),
+                "enabled": GLib.Variant("b", False),
+            },
+            "children": [],
+        })
+
+        # 2. Separator
+        root_children.append({
+            "id": 2,
+            "props": {"type": GLib.Variant("s", "separator")},
+            "children": [],
+        })
+
+        # 3. Toggle dictation
+        root_children.append({
+            "id": 3,
+            "props": {
+                "label": GLib.Variant("s", toggle_label),
+                "enabled": GLib.Variant("b", True),
+                "icon-name": GLib.Variant("s", "audio-input-microphone"),
+            },
+            "children": [],
+            "action": lambda: subprocess.Popen(["whispy-client", "toggle"]),
+        })
+
+        # 4. Cancel
+        root_children.append({
+            "id": 4,
+            "props": {
+                "label": GLib.Variant("s", "Cancel dictation"),
+                "enabled": GLib.Variant("b", True),
+                "icon-name": GLib.Variant("s", "process-stop"),
+            },
+            "children": [],
+            "action": lambda: (
+                subprocess.Popen(["whispy-client", "cancel"]),
+                subprocess.Popen(["notify-send", "-a", "Whispy", "-i", "whispy-error", "Dictation cancelled", "Audio capture was discarded"])
+            ),
+        })
+
+        # 5. Separator
+        root_children.append({
+            "id": 5,
+            "props": {"type": GLib.Variant("s", "separator")},
+            "children": [],
+        })
+
+        # 6. History Submenu (last 10 transcripts)
+        recent = self.load_recent_transcripts(10)
+        history_children = []
+
+        if recent:
+            for idx, entry in enumerate(recent, 1):
+                raw_text = entry["text"].strip()
+                preview = " ".join(raw_text.split())
+                if len(preview) > 42:
+                    preview = preview[:39] + "..."
+                item_id = 100 + idx
+                history_children.append({
+                    "id": item_id,
+                    "props": {
+                        "label": GLib.Variant("s", f"{idx}. {preview}"),
+                        "enabled": GLib.Variant("b", True),
+                        "icon-name": GLib.Variant("s", "edit-copy"),
+                    },
+                    "children": [],
+                    "action": (lambda t=raw_text: self.copy_to_clipboard(t)),
+                })
+
+            history_children.append({
+                "id": 150,
+                "props": {"type": GLib.Variant("s", "separator")},
+                "children": [],
+            })
+            history_children.append({
+                "id": 151,
+                "props": {
+                    "label": GLib.Variant("s", "Open full log (transcripts.jsonl)"),
+                    "enabled": GLib.Variant("b", True),
+                    "icon-name": GLib.Variant("s", "document-open"),
+                },
+                "children": [],
+                "action": lambda: subprocess.Popen(["xdg-open", self.transcripts_file]),
+            })
+        else:
+            history_children.append({
+                "id": 101,
+                "props": {
+                    "label": GLib.Variant("s", "(No recent recordings)"),
+                    "enabled": GLib.Variant("b", False),
+                },
+                "children": [],
+            })
+
+        root_children.append({
+            "id": 50,
+            "props": {
+                "label": GLib.Variant("s", f"History ({len(recent)})"),
+                "children-display": GLib.Variant("s", "submenu"),
+                "icon-name": GLib.Variant("s", "document-open-recent"),
+            },
+            "children": history_children,
+        })
+
+        # 7. Separator
+        root_children.append({
+            "id": 6,
+            "props": {"type": GLib.Variant("s", "separator")},
+            "children": [],
+        })
+
+        # 8. Configuration
+        config_path = os.path.expanduser("~/.config/whispy/config.toml")
+        root_children.append({
+            "id": 7,
+            "props": {
+                "label": GLib.Variant("s", "Edit configuration (config.toml)"),
+                "enabled": GLib.Variant("b", True),
+                "icon-name": GLib.Variant("s", "preferences-system"),
+            },
+            "children": [],
+            "action": lambda: subprocess.Popen(["xdg-open", config_path]),
+        })
+
+        # 9. Restart daemon
+        root_children.append({
+            "id": 8,
+            "props": {
+                "label": GLib.Variant("s", "Restart daemon (whispy-daemon)"),
+                "enabled": GLib.Variant("b", True),
+                "icon-name": GLib.Variant("s", "view-refresh"),
+            },
+            "children": [],
+            "action": lambda: (
+                subprocess.Popen(["systemctl", "--user", "restart", "whispy-daemon.service"]),
+                subprocess.Popen(["notify-send", "-a", "Whispy", "-i", "whispy-idle", "Whispy", "Restarting whispy-daemon..."])
+            ),
+        })
+
+        # 10. Separator
+        root_children.append({
+            "id": 9,
+            "props": {"type": GLib.Variant("s", "separator")},
+            "children": [],
+        })
+
+        # 11. Quit
+        root_children.append({
+            "id": 10,
+            "props": {
+                "label": GLib.Variant("s", "Quit"),
+                "enabled": GLib.Variant("b", True),
+                "icon-name": GLib.Variant("s", "application-exit"),
+            },
+            "children": [],
+            "action": lambda: subprocess.Popen(["systemctl", "--user", "stop", "whispy-tray.service"]),
+        })
+
+        self.root_menu = {
+            "id": 0,
+            "props": {"children-display": GLib.Variant("s", "submenu")},
+            "children": root_children,
+        }
+
+        def index_items(item):
+            self.menu_items_map[item["id"]] = item
+            for c in item.get("children", []):
+                index_items(c)
+
+        index_items(self.root_menu)
+
+    def serialize_item_tuple(self, item, depth, max_depth, property_names):
+        props = dict(item["props"])
+        if property_names:
+            props = {k: v for k, v in props.items() if k in property_names}
+
+        if max_depth == 0 or (max_depth > 0 and depth >= max_depth):
+            children_vars = []
+        else:
+            children_vars = [
+                GLib.Variant("(ia{sv}av)", self.serialize_item_tuple(c, depth + 1, max_depth, property_names))
+                for c in item.get("children", [])
+            ]
+        return (item["id"], props, children_vars)
+
+    # --- DBusMenu Handlers ---
+    def handle_dbusmenu_method(self, conn, sender, object_path, interface_name, method_name, parameters, invocation):
+        if method_name == "GetLayout":
+            parent_id, recursion_depth, property_names = parameters.unpack()
+            target_item = self.menu_items_map.get(parent_id, self.root_menu)
+            serialized = self.serialize_item_tuple(target_item, 0, recursion_depth, property_names)
+            invocation.return_value(GLib.Variant("(u(ia{sv}av))", (self.menu_revision, serialized)))
+
+        elif method_name == "GetGroupProperties":
+            ids, property_names = parameters.unpack()
+            res = []
+            for i in ids:
+                if i in self.menu_items_map:
+                    props = dict(self.menu_items_map[i]["props"])
+                    if property_names:
+                        props = {k: v for k, v in props.items() if k in property_names}
+                    res.append((i, props))
+            invocation.return_value(GLib.Variant("(a(ia{sv}))", (res,)))
+
+        elif method_name == "GetProperty":
+            item_id, name = parameters.unpack()
+            val = GLib.Variant("s", "")
+            if item_id in self.menu_items_map:
+                val = self.menu_items_map[item_id]["props"].get(name, GLib.Variant("s", ""))
+            invocation.return_value(GLib.Variant("(v)", (val,)))
+
+        elif method_name == "AboutToShow":
+            self.rebuild_menu_tree()
+            invocation.return_value(GLib.Variant("(b)", (False,)))
+
+        elif method_name == "AboutToShowGroup":
+            self.rebuild_menu_tree()
+            invocation.return_value(GLib.Variant("(aiai)", ([], [])))
+
+        elif method_name == "Event":
+            item_id, event_id, data, timestamp = parameters.unpack()
+            if event_id == "clicked" and item_id in self.menu_items_map:
+                action = self.menu_items_map[item_id].get("action")
+                if action:
+                    action()
+            invocation.return_value(None)
+
+        elif method_name == "EventGroup":
+            events = parameters.unpack()[0]
+            for item_id, event_id, data, timestamp in events:
+                if event_id == "clicked" and item_id in self.menu_items_map:
+                    action = self.menu_items_map[item_id].get("action")
+                    if action:
+                        action()
+            invocation.return_value(GLib.Variant("(ai)", ([],)))
+
+        else:
+            invocation.return_value(None)
+
+    def handle_dbusmenu_property(self, conn, sender, object_path, interface_name, property_name):
+        if property_name == "Version":
+            return GLib.Variant("u", 3)
+        elif property_name == "Status":
+            return GLib.Variant("s", "normal")
+        elif property_name == "TextDirection":
+            return GLib.Variant("s", "ltr")
+        elif property_name == "IconThemePath":
+            return GLib.Variant("as", [])
+        return None
+
 def main():
     tray = WhispyTray()
-    node_info = Gio.DBusNodeInfo.new_for_xml(SNI_XML)
-    interface_info = node_info.interfaces[0]
-
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     tray.conn = bus
 
+    sni_node_info = Gio.DBusNodeInfo.new_for_xml(SNI_XML)
     bus.register_object(
         "/StatusNotifierItem",
-        interface_info,
-        tray.handle_method_call,
-        tray.handle_get_property,
+        sni_node_info.interfaces[0],
+        tray.handle_sni_method,
+        tray.handle_sni_property,
         None
     )
 
+    dbusmenu_node_info = Gio.DBusNodeInfo.new_for_xml(DBUSMENU_XML)
+    bus.register_object(
+        "/MenuBar",
+        dbusmenu_node_info.interfaces[0],
+        tray.handle_dbusmenu_method,
+        tray.handle_dbusmenu_property,
+        None
+    )
+
+    # Register with watcher
     def register_watcher():
         try:
             bus.call_sync(
@@ -271,7 +677,7 @@ def main():
     # Initial check
     tray.update_state()
 
-    # Poll state.json every 50ms for responsive state transitions
+    # Poll state.json every 50ms for instant icon reaction
     GLib.timeout_add(50, tray.update_state)
 
     loop = GLib.MainLoop()
