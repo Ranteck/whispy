@@ -14,9 +14,11 @@ the tray icon, tooltip, and context menu based on state and transcripts:
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
+import tomllib
 import warnings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -135,6 +137,9 @@ class WhispyTray:
         )
         state_home = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
         self.transcripts_file = os.path.join(state_home, "whispy", "transcripts.jsonl")
+        cfg_dir = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+        self.config_file = os.path.join(cfg_dir, "whispy", "config.toml")
+        self.muted_by_whispy = False
 
         self.current_state = "idle"
         self.conn = None
@@ -237,8 +242,16 @@ class WhispyTray:
                 pass
 
         if new_state != self.current_state:
+            old_state = self.current_state
             self.current_state = new_state
             self.icon_name, self.tooltip_text = self.get_icon_and_tooltip(new_state, err_msg)
+
+            # System audio ducking / muting while recording
+            if new_state == "recording" and old_state != "recording":
+                self.apply_playback_mute(True)
+            elif old_state == "recording" and new_state != "recording":
+                self.apply_playback_mute(False)
+
             self.rebuild_menu_tree()
             self.emit_signals()
         return True
@@ -304,6 +317,80 @@ class WhispyTray:
         elif property_name == "ToolTip":
             return GLib.Variant("(sa(iiay)ss)", ("", [], "Whispy Dictation", self.tooltip_text))
         return None
+
+    # --- System Audio Muting Helpers ---
+    def is_mute_playback_enabled(self):
+        if not os.path.isfile(self.config_file):
+            return False
+        try:
+            with open(self.config_file, "rb") as f:
+                data = tomllib.load(f)
+                return bool(data.get("audio", {}).get("mute_playback", False))
+        except Exception:
+            return False
+
+    def toggle_mute_playback(self):
+        current = self.is_mute_playback_enabled()
+        new_val = not current
+        if os.path.isfile(self.config_file):
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if "mute_playback" in content:
+                    content = re.sub(
+                        r"(?m)^\s*mute_playback\s*=.*$",
+                        f"mute_playback = {'true' if new_val else 'false'}",
+                        content
+                    )
+                else:
+                    content = content.replace("[audio]\n", f"[audio]\n# Automatically mute system audio while recording:\nmute_playback = {'true' if new_val else 'false'}\n")
+                with open(self.config_file, "w", encoding="utf-8") as f:
+                    f.write(content)
+                status_str = "Enabled" if new_val else "Disabled"
+                subprocess.Popen([
+                    "notify-send",
+                    "-a", "Whispy",
+                    "-i", "whispy-idle",
+                    "Mute audio while recording",
+                    f"Status: {status_str}"
+                ])
+                self.rebuild_menu_tree()
+                self.emit_signals()
+            except Exception as e:
+                sys.stderr.write(f"whispy-tray: error updating mute_playback: {e}\n")
+
+    def apply_playback_mute(self, enable):
+        if enable:
+            if not self.is_mute_playback_enabled():
+                return
+            # Check if sink is already muted
+            try:
+                res = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], capture_output=True, text=True)
+                if "[MUTED]" in res.stdout:
+                    self.muted_by_whispy = False
+                    return
+                subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1"], check=True)
+                self.muted_by_whispy = True
+            except Exception:
+                try:
+                    res = subprocess.run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"], capture_output=True, text=True)
+                    if "yes" in res.stdout.lower():
+                        self.muted_by_whispy = False
+                        return
+                    subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1"])
+                    self.muted_by_whispy = True
+                except Exception:
+                    pass
+        else:
+            if self.muted_by_whispy:
+                self.muted_by_whispy = False
+                try:
+                    subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"])
+                except Exception:
+                    try:
+                        subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"])
+                    except Exception:
+                        pass
 
     # --- History & Clipboard helpers ---
     def load_recent_transcripts(self, limit=10):
@@ -490,8 +577,21 @@ class WhispyTray:
             "children": [],
         })
 
-        # 8. Configuration
-        config_path = os.path.expanduser("~/.config/whispy/config.toml")
+        # 8. Mute playback toggle
+        mute_on = self.is_mute_playback_enabled()
+        root_children.append({
+            "id": 65,
+            "props": {
+                "label": GLib.Variant("s", f"Mute audio while recording: {'[✓ Enabled]' if mute_on else '[✗ Disabled]'}"),
+                "enabled": GLib.Variant("b", True),
+                "icon-name": GLib.Variant("s", "audio-volume-muted" if mute_on else "audio-volume-high"),
+            },
+            "children": [],
+            "action": self.toggle_mute_playback,
+        })
+
+        # 9. Configuration
+        config_path = self.config_file
         root_children.append({
             "id": 7,
             "props": {
@@ -503,7 +603,7 @@ class WhispyTray:
             "action": lambda: subprocess.Popen(["xdg-open", config_path]),
         })
 
-        # 9. Restart daemon
+        # 10. Restart daemon
         root_children.append({
             "id": 8,
             "props": {
@@ -518,14 +618,14 @@ class WhispyTray:
             ),
         })
 
-        # 10. Separator
+        # 11. Separator
         root_children.append({
             "id": 9,
             "props": {"type": GLib.Variant("s", "separator")},
             "children": [],
         })
 
-        # 11. Quit
+        # 12. Quit
         root_children.append({
             "id": 10,
             "props": {
@@ -534,7 +634,10 @@ class WhispyTray:
                 "icon-name": GLib.Variant("s", "application-exit"),
             },
             "children": [],
-            "action": lambda: subprocess.Popen(["systemctl", "--user", "stop", "whispy-tray.service"]),
+            "action": lambda: (
+                self.apply_playback_mute(False),
+                subprocess.Popen(["systemctl", "--user", "stop", "whispy-tray.service"])
+            ),
         })
 
         self.root_menu = {
@@ -683,6 +786,7 @@ def main():
     loop = GLib.MainLoop()
 
     def handle_signal(*args):
+        tray.apply_playback_mute(False)
         loop.quit()
 
     signal.signal(signal.SIGINT, handle_signal)

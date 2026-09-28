@@ -29,6 +29,7 @@ The indicator reflects the real-time state published by `whispy-daemon` in `$XDG
   - **Live Status Header**: Displays the current daemon activity.
   - **Start / Stop Dictation**: Toggle capture directly from the menu.
   - **Cancel Dictation**: Abort the active capture and discard buffered audio.
+  - **Mute Audio While Recording**: Automatically ducks/mutes system audio output (`wpctl` / `pactl`) while capturing speech to prevent desktop audio (music, videos, voice calls) from bleeding into the microphone buffer. Can be toggled live from the context menu or configured via `mute_playback = true` in `config.toml`.
   - **Recording History Submenu**: Lists the last 10 transcribed recordings. Clicking any entry copies the full transcript to the clipboard (`wl-copy` / `xclip`) with a toast notification. Includes a shortcut to open the full `transcripts.jsonl` log.
   - **Edit Configuration**: Quick shortcut to open `~/.config/whispy/config.toml` in your default editor.
   - **Restart Daemon**: Restart `whispy-daemon.service` with one click.
