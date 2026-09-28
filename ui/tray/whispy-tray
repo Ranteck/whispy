@@ -144,8 +144,14 @@ class WhispyTray:
         self.current_state = "idle"
         self.conn = None
         self.menu_revision = 1
-        self.menu_items_map = {}
         self.root_menu = None
+        self.last_copied_ts = 0.0
+        try:
+            recent = self.load_recent_transcripts(1)
+            if recent:
+                self.last_copied_ts = float(recent[0].get("timestamp", 0.0))
+        except Exception:
+            pass
 
         # Resolve icon directory
         self.icon_dir = self.resolve_icon_dir()
@@ -252,6 +258,11 @@ class WhispyTray:
             elif old_state == "recording" and new_state != "recording":
                 self.apply_playback_mute(False)
 
+            # Auto-save transcript to clipboard after dictation finishes
+            if new_state in ("success", "idle") and old_state in ("recording", "transcribing", "success"):
+                if self.is_save_clipboard_enabled():
+                    GLib.timeout_add(100, self.auto_copy_latest_transcript)
+
             self.rebuild_menu_tree()
             self.emit_signals()
         return True
@@ -329,35 +340,7 @@ class WhispyTray:
         except Exception:
             return False
 
-    def toggle_mute_playback(self):
-        current = self.is_mute_playback_enabled()
-        new_val = not current
-        if os.path.isfile(self.config_file):
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-                if "mute_playback" in content:
-                    content = re.sub(
-                        r"(?m)^\s*mute_playback\s*=.*$",
-                        f"mute_playback = {'true' if new_val else 'false'}",
-                        content
-                    )
-                else:
-                    content = content.replace("[audio]\n", f"[audio]\n# Automatically mute system audio while recording:\nmute_playback = {'true' if new_val else 'false'}\n")
-                with open(self.config_file, "w", encoding="utf-8") as f:
-                    f.write(content)
-                status_str = "Enabled" if new_val else "Disabled"
-                subprocess.Popen([
-                    "notify-send",
-                    "-a", "Whispy",
-                    "-i", "whispy-idle",
-                    "Mute audio while recording",
-                    f"Status: {status_str}"
-                ])
-                self.rebuild_menu_tree()
-                self.emit_signals()
-            except Exception as e:
-                sys.stderr.write(f"whispy-tray: error updating mute_playback: {e}\n")
+
 
     def apply_playback_mute(self, enable):
         if enable:
@@ -392,6 +375,22 @@ class WhispyTray:
                     except Exception:
                         pass
 
+    # --- Clipboard Auto-save Helpers ---
+    def is_save_clipboard_enabled(self):
+        if not os.path.isfile(self.config_file):
+            return True
+        try:
+            with open(self.config_file, "rb") as f:
+                data = tomllib.load(f)
+                inj = data.get("injection", {})
+                if "save_clipboard" in inj:
+                    return bool(inj.get("save_clipboard"))
+                return bool(data.get("audio", {}).get("save_clipboard", True))
+        except Exception:
+            return True
+
+
+
     # --- History & Clipboard helpers ---
     def load_recent_transcripts(self, limit=10):
         if not os.path.isfile(self.transcripts_file):
@@ -413,33 +412,43 @@ class WhispyTray:
             sys.stderr.write(f"whispy-tray: error loading transcripts: {e}\n")
         return items[-limit:][::-1]
 
-    def copy_to_clipboard(self, text):
+    def copy_to_clipboard(self, text, show_notify=True):
         try:
-            # Try wl-copy (Wayland), fallback to xclip (X11)
-            copied = False
-            for copy_tool in [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]:
-                try:
-                    p = subprocess.Popen(copy_tool, stdin=subprocess.PIPE)
-                    p.communicate(input=text.encode("utf-8"))
-                    if p.returncode == 0:
-                        copied = True
-                        break
-                except FileNotFoundError:
-                    continue
+            if shutil.which("wl-copy") and (os.environ.get("WAYLAND_DISPLAY") or not os.environ.get("DISPLAY")):
+                subprocess.run(["wl-copy", "--", text], check=True)
+            elif shutil.which("xclip"):
+                subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode("utf-8"), check=True)
+            elif shutil.which("xsel"):
+                subprocess.run(["xsel", "--clipboard", "--input"], input=text.encode("utf-8"), check=True)
+            else:
+                subprocess.run(["wl-copy", "--", text], check=True)
 
-            preview = " ".join(text.split())
-            if len(preview) > 55:
-                preview = preview[:52] + "..."
-
-            subprocess.Popen([
-                "notify-send",
-                "-a", "Whispy",
-                "-i", "whispy-idle",
-                "Copied to clipboard",
-                preview
-            ])
+            if show_notify:
+                preview = " ".join(text.split())
+                if len(preview) > 55:
+                    preview = preview[:52] + "..."
+                subprocess.Popen([
+                    "notify-send",
+                    "-a", "Whispy",
+                    "-i", "whispy-idle",
+                    "Copied to clipboard",
+                    preview
+                ])
         except Exception as e:
             sys.stderr.write(f"whispy-tray: copy error: {e}\n")
+
+    def auto_copy_latest_transcript(self):
+        recent = self.load_recent_transcripts(1)
+        if not recent:
+            return False
+        latest = recent[0]
+        ts = float(latest.get("timestamp", 0.0))
+        text = latest.get("text", "").strip()
+        if ts > self.last_copied_ts and text:
+            self.last_copied_ts = ts
+            sys.stderr.write(f"whispy-tray: auto-copied latest transcript (ts={ts}) to clipboard\n")
+            self.copy_to_clipboard(text, show_notify=False)
+        return False
 
     # --- DBusMenu Tree Construction ---
     def rebuild_menu_tree(self):
@@ -577,20 +586,7 @@ class WhispyTray:
             "children": [],
         })
 
-        # 8. Mute playback toggle
-        mute_on = self.is_mute_playback_enabled()
-        root_children.append({
-            "id": 65,
-            "props": {
-                "label": GLib.Variant("s", f"Mute audio while recording: {'[✓ Enabled]' if mute_on else '[✗ Disabled]'}"),
-                "enabled": GLib.Variant("b", True),
-                "icon-name": GLib.Variant("s", "audio-volume-muted" if mute_on else "audio-volume-high"),
-            },
-            "children": [],
-            "action": self.toggle_mute_playback,
-        })
-
-        # 9. Configuration
+        # 8. Configuration
         config_path = self.config_file
         root_children.append({
             "id": 7,

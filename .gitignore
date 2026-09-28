@@ -2,3 +2,5 @@
 /samples
 *.wav
 /.agents/worktrees/
+__pycache__/
+
