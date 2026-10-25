@@ -1,17 +1,17 @@
-//! `PipeWire` audio capture via `pw-record` (raw s16le mono), with RMS metering,
+//! `PipeWire` audio capture via `pw-record` (AU container or raw s16 PCM), with RMS metering,
 //! digital gain, and clip-duration limits.
 //!
-//! `pw-record --format s16 -` streams headerless little-endian PCM to stdout. A
-//! reader thread parses it into `i16` samples, applies `audio.gain`, reports RMS
-//! every `audio.rms_interval_ms`, and caps the buffer at `audio.max_clip_secs`
-//! (firing `on_too_long`). The first ~50 ms are dropped to skip the USB codec's
+//! `pw-record --format s16 -` streams AU-wrapped or raw PCM to stdout. A reader
+//! thread sniffs the stream header, parses it into `i16` samples, applies `audio.gain`,
+//! reports RMS every `audio.rms_interval_ms`, and caps the buffer at `audio.max_clip_secs`
+//! (firing `on_too_long`). The first ~50 ms after the header are dropped to skip the USB codec's
 //! stream-start transient, which would otherwise dominate peak normalization.
 //!
 //! On stop, the buffer is peak-normalized (only amplifying quiet clips) before
 //! transcription — the mic records ~20-25 dB low (see docs/stt-benchmark.md).
 
 use std::io::{BufReader, ErrorKind, Read};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -153,8 +153,46 @@ impl Capture {
     }
 }
 
+/// Byte order of incoming audio samples.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Endian {
+    Big,
+    Little,
+}
+
+/// Sniffs the start of the audio stream for an AU container or raw PCM.
+fn sniff_header(buf: &[u8]) -> Option<(&'static str, &'static str, usize, Endian)> {
+    if buf.len() < 8 {
+        return None;
+    }
+    // PipeWire 1.6.10+ writes AU in native big-endian (.snd); older versions wrote AU little-endian (dns.) or raw PCM.
+    if buf.starts_with(b".snd") {
+        let offset = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        Some((
+            "au",
+            "big",
+            usize::try_from(offset).unwrap_or(usize::MAX),
+            Endian::Big,
+        ))
+    } else if buf.starts_with(b"dns.") {
+        let offset = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        Some((
+            "au",
+            "little",
+            usize::try_from(offset).unwrap_or(usize::MAX),
+            Endian::Little,
+        ))
+    } else {
+        Some(("raw", "little", 0, Endian::Little))
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "stateful audio streaming loop coordinating header sniffing, transient skip, RMS metering, and silence auto-stop"
+)]
 fn read_loop<R, M, S>(
-    stdout: ChildStdout,
+    stdout: impl Read,
     cfg: &Audio,
     signals: Signals,
     on_rms: R,
@@ -176,6 +214,10 @@ where
     let skip_samples = (u64::from(cfg.rate) * SKIP_MS / 1000) as usize;
     let gain = cfg.gain;
 
+    let mut header_discard = 0usize;
+    let mut endian = Endian::Little;
+    let mut format_detected = false;
+
     // Speech-energy bookkeeping. A window above `silence_threshold` counts as
     // speech; `speech_seen` gates both the no-speech drop (a clip that never
     // crossed the threshold is silence) and arming the trailing-silence auto-stop
@@ -195,61 +237,97 @@ where
         if signals.stop.load(Ordering::Relaxed) {
             break;
         }
-        let n = match reader.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => n,
+        let eof = match reader.read(&mut chunk) {
+            Ok(0) => true,
+            Ok(n) => {
+                leftover.extend_from_slice(&chunk[..n]);
+                false
+            }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
                 warn!(error = %e, "capture read error");
-                break;
+                true
             }
         };
 
-        leftover.extend_from_slice(&chunk[..n]);
-        let full = leftover.len() - (leftover.len() % 2);
-        for pair in leftover[..full].as_chunks::<2>().0 {
-            // Drop the stream-start transient.
-            if skipped < skip_samples {
-                skipped += 1;
+        if !format_detected {
+            if let Some((container, byte_order, discard, end)) = sniff_header(&leftover) {
+                debug!(container, byte_order, "stream container detected");
+                header_discard = discard;
+                endian = end;
+                format_detected = true;
+            } else if eof {
+                debug!(
+                    container = "raw",
+                    byte_order = "little",
+                    "stream container detected"
+                );
+                format_detected = true;
+            } else {
                 continue;
             }
-            let sample = apply_gain(i16::from_le_bytes([pair[0], pair[1]]), gain);
-            samples.push(sample);
+        }
 
-            let norm = f64::from(sample) / 32768.0;
-            sq_sum += norm * norm;
-            window_count += 1;
-            if window_count >= window_len {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "RMS of normalized samples lies in [0, 1]; f32 is plenty"
-                )]
-                let rms = ((sq_sum / window_count as f64).sqrt() as f32).clamp(0.0, 1.0);
-                on_rms(rms);
-                sq_sum = 0.0;
-                window_count = 0;
+        if header_discard > 0 {
+            let to_drop = leftover.len().min(header_discard);
+            leftover.drain(..to_drop);
+            header_discard -= to_drop;
+        }
 
-                if rms > silence_threshold {
-                    speech_seen = true;
-                    silent_windows = 0;
-                } else if speech_seen {
-                    // Trailing silence after speech: arm the auto-stop if enabled.
-                    silent_windows += 1;
-                    if let Some(limit) = silence_limit
-                        && silent_windows >= limit
-                    {
-                        hit_silence = true;
-                        break 'outer;
+        if header_discard == 0 {
+            let full = leftover.len() - (leftover.len() % 2);
+            for pair in leftover[..full].as_chunks::<2>().0 {
+                // Drop the stream-start transient.
+                if skipped < skip_samples {
+                    skipped += 1;
+                    continue;
+                }
+                let raw = match endian {
+                    Endian::Big => i16::from_be_bytes([pair[0], pair[1]]),
+                    Endian::Little => i16::from_le_bytes([pair[0], pair[1]]),
+                };
+                let sample = apply_gain(raw, gain);
+                samples.push(sample);
+
+                let norm = f64::from(sample) / 32768.0;
+                sq_sum += norm * norm;
+                window_count += 1;
+                if window_count >= window_len {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "RMS of normalized samples lies in [0, 1]; f32 is plenty"
+                    )]
+                    let rms = ((sq_sum / window_count as f64).sqrt() as f32).clamp(0.0, 1.0);
+                    on_rms(rms);
+                    sq_sum = 0.0;
+                    window_count = 0;
+
+                    if rms > silence_threshold {
+                        speech_seen = true;
+                        silent_windows = 0;
+                    } else if speech_seen {
+                        // Trailing silence after speech: arm the auto-stop if enabled.
+                        silent_windows += 1;
+                        if let Some(limit) = silence_limit
+                            && silent_windows >= limit
+                        {
+                            hit_silence = true;
+                            break 'outer;
+                        }
                     }
                 }
-            }
 
-            if samples.len() >= max_samples {
-                too_long = true;
-                break 'outer;
+                if samples.len() >= max_samples {
+                    too_long = true;
+                    break 'outer;
+                }
             }
+            leftover.drain(..full);
         }
-        leftover.drain(..full);
+
+        if eof {
+            break;
+        }
     }
 
     signals.speech_heard.store(speech_seen, Ordering::Relaxed);
@@ -333,5 +411,103 @@ mod tests {
         // Near-silence is untouched.
         let silence = vec![0, 50, -40];
         assert_eq!(normalize_peak(silence.clone()), silence);
+    }
+
+    fn test_audio_config() -> Audio {
+        let cfg: crate::config::Config =
+            toml::from_str(crate::config::default_config_toml()).expect("default.toml must parse");
+        cfg.audio
+    }
+
+    fn make_au_header(be: bool, offset: u32) -> Vec<u8> {
+        let mut header = Vec::with_capacity(24);
+        if be {
+            header.extend_from_slice(b".snd");
+            header.extend_from_slice(&offset.to_be_bytes());
+            header.extend_from_slice(&0xffff_ffffu32.to_be_bytes());
+            header.extend_from_slice(&3u32.to_be_bytes());
+            header.extend_from_slice(&16000u32.to_be_bytes());
+            header.extend_from_slice(&1u32.to_be_bytes());
+        } else {
+            header.extend_from_slice(b"dns.");
+            header.extend_from_slice(&offset.to_le_bytes());
+            header.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+            header.extend_from_slice(&3u32.to_le_bytes());
+            header.extend_from_slice(&16000u32.to_le_bytes());
+            header.extend_from_slice(&1u32.to_le_bytes());
+        }
+        header
+    }
+
+    struct ChunkedReader<R> {
+        inner: R,
+        max_chunk: usize,
+    }
+
+    impl<R: Read> Read for ChunkedReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let cap = buf.len().min(self.max_chunk);
+            self.inner.read(&mut buf[..cap])
+        }
+    }
+
+    #[test]
+    fn au_big_endian_stream_decodes_samples() {
+        let cfg = test_audio_config();
+        let mut stream = make_au_header(true, 24);
+        for _ in 0..2400 {
+            stream.extend_from_slice(&1000i16.to_be_bytes());
+        }
+        let samples = read_loop(&stream[..], &cfg, Signals::default(), |_| {}, || {}, || {});
+        for &s in &samples {
+            assert_eq!(s, 1000);
+        }
+        assert_eq!(samples.len(), 1600);
+    }
+
+    #[test]
+    fn au_little_endian_stream_skips_header() {
+        let cfg = test_audio_config();
+        let mut stream = make_au_header(false, 24);
+        for _ in 0..2400 {
+            stream.extend_from_slice(&1000i16.to_le_bytes());
+        }
+        let samples = read_loop(&stream[..], &cfg, Signals::default(), |_| {}, || {}, || {});
+        for &s in &samples {
+            assert_eq!(s, 1000);
+        }
+        assert_eq!(samples.len(), 1600);
+    }
+
+    #[test]
+    fn raw_stream_decodes_little_endian() {
+        let cfg = test_audio_config();
+        let mut stream = Vec::new();
+        for _ in 0..2400 {
+            stream.extend_from_slice(&1000i16.to_le_bytes());
+        }
+        let samples = read_loop(&stream[..], &cfg, Signals::default(), |_| {}, || {}, || {});
+        for &s in &samples {
+            assert_eq!(s, 1000);
+        }
+        assert_eq!(samples.len(), 1600);
+    }
+
+    #[test]
+    fn au_header_split_across_reads() {
+        let cfg = test_audio_config();
+        let mut stream = make_au_header(true, 24);
+        for _ in 0..2400 {
+            stream.extend_from_slice(&1000i16.to_be_bytes());
+        }
+        let reader = ChunkedReader {
+            inner: &stream[..],
+            max_chunk: 3,
+        };
+        let samples = read_loop(reader, &cfg, Signals::default(), |_| {}, || {}, || {});
+        for &s in &samples {
+            assert_eq!(s, 1000);
+        }
+        assert_eq!(samples.len(), 1600);
     }
 }
