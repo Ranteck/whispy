@@ -119,6 +119,14 @@ it manually:
 systemctl --user enable --now whispy-tray.service
 ```
 
+The AUR packages ship that unit. From source, install it first and point `ExecStart` at your
+binary (the shipped unit expects `~/.cargo/bin/whispy-tray`):
+
+```sh
+install -Dm644 systemd/whispy-tray.service -t ~/.config/systemd/user/
+systemctl --user edit --full whispy-tray.service   # only if the binary lives elsewhere
+```
+
 - **Left click** — toggle dictation (`whispy-client toggle`).
 - **Middle click** — cancel dictation (`whispy-client cancel`).
 - **Right click** — open the tray menu (start/stop, cancel, recent transcript history,

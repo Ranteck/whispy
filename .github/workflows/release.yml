@@ -21,7 +21,7 @@ jobs:
       - run: cargo build --release --locked
       - name: Package binaries
         run: |
-          # The two whispy binaries only. whisper-server and the model are NOT
+          # The whispy binaries only. whisper-server and the model are NOT
           # shipped — `whispy-daemon setup` bootstraps them per-machine.
           mkdir -p dist
           cp target/release/whispy-daemon target/release/whispy-client target/release/whispy-tray dist/
