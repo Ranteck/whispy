@@ -1,6 +1,11 @@
 //! Tray settings read from the daemon's configuration file.
 
-use std::{fmt, fs, io, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
+use std::{
+    fmt, fs, io,
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+};
 
 /// Dictation languages offered by the tray.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -231,26 +236,41 @@ pub fn with_language(text: &str, lang: Language) -> Result<String, SettingsError
 
 /// Persist a language selection, or return false if the configuration is absent.
 pub fn write_language(path: &Path, lang: Language) -> Result<bool, SettingsError> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
+    let target = match fs::canonicalize(path) {
+        Ok(target) => target,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             tracing::debug!(event = "tray_language_updated", outcome = "missing");
             return Ok(false);
         }
         Err(error) => return Err(SettingsError::Io(error)),
     };
+    let text = fs::read_to_string(&target).map_err(SettingsError::Io)?;
     let updated = with_language(&text, lang)?;
-    let temporary = path.with_extension("toml.tmp");
-    // The daemon configuration can contain API keys; never create a readable temporary copy.
+    let permissions = fs::metadata(&target)
+        .map_err(SettingsError::Io)?
+        .permissions();
+    let mut temporary = target.as_os_str().to_os_string();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    // Recover the fixed temporary path after an interrupted previous write.
+    if let Err(error) = fs::remove_file(&temporary)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(SettingsError::Io(error));
+    }
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(permissions.mode())
         .open(&temporary)
         .map_err(SettingsError::Io)?;
     file.write_all(updated.as_bytes())
         .map_err(SettingsError::Io)?;
-    fs::rename(&temporary, path).map_err(SettingsError::Io)?;
+    // Creation applies the process umask; restore the user's exact mode before replacement.
+    file.set_permissions(permissions)
+        .map_err(SettingsError::Io)?;
+    file.sync_all().map_err(SettingsError::Io)?;
+    fs::rename(&temporary, &target).map_err(SettingsError::Io)?;
     tracing::info!(
         event = "tray_language_updated",
         outcome = "updated",
@@ -439,6 +459,76 @@ mod tests {
             "[stt]\nlanguage = \"en\" # keep\n[workflow.x]\nlanguage = 'fr'\n"
         );
         assert!(!dir.join("config.toml.tmp").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_language_follows_symlink() {
+        let dir = std::env::temp_dir().join(format!("whispy-tray-symlink-{}", std::process::id()));
+        let config_dir = dir.join("config");
+        let target_dir = dir.join("dotfiles");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        let path = config_dir.join("config.toml");
+        let target = target_dir.join("config.toml");
+        fs::write(&target, "[stt]\nlanguage = 'es'\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(write_language(&path, Language::En).unwrap());
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&path).unwrap(), target);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "[stt]\nlanguage = \"en\"\n"
+        );
+        assert!(!target_dir.join("config.toml.tmp").exists());
+        assert!(!config_dir.join("config.toml.tmp").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_language_preserves_mode() {
+        let dir = std::env::temp_dir().join(format!("whispy-tray-mode-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        for mode in [0o644, 0o600] {
+            fs::write(&path, "[stt]\nlanguage = 'es'\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(write_language(&path, Language::En).unwrap());
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "[stt]\nlanguage = \"en\"\n"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_language_replaces_stale_temp() {
+        let dir = std::env::temp_dir().join(format!("whispy-tray-stale-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for filename in ["config.toml", "settings.conf"] {
+            let path = dir.join(filename);
+            let temporary = dir.join(format!("{filename}.tmp"));
+            fs::write(&path, "[stt]\nlanguage = 'es'\n").unwrap();
+            fs::write(&temporary, "partial previous write").unwrap();
+
+            assert!(write_language(&path, Language::En).unwrap());
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "[stt]\nlanguage = \"en\"\n"
+            );
+            assert!(!temporary.exists());
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
