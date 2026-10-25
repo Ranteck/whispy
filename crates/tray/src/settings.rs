@@ -69,12 +69,6 @@ impl Default for Settings {
     }
 }
 
-/// Read tray settings, using defaults for missing or malformed configuration.
-pub fn parse(text: &str) -> Settings {
-    // Malformed configuration intentionally falls back to the tray defaults.
-    parse_settings(text).unwrap_or_default()
-}
-
 fn parse_settings(text: &str) -> Result<Settings, toml::de::Error> {
     let value: toml::Value = toml::from_str(text)?;
     Ok(Settings {
@@ -298,6 +292,10 @@ fn comment_start(value: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(text: &str) -> Settings {
+        parse_settings(text).unwrap_or_default()
+    }
 
     #[test]
     fn parse_defaults_language_auto() {

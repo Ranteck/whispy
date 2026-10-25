@@ -19,7 +19,6 @@ pub fn client_path(exe: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
 }
 
 /// Spawn `program` with `args` on a background thread and log a warning on failure.
-#[cfg_attr(test, expect(dead_code, reason = "wired into main in Task 7"))]
 pub fn spawn_detached(program: &Path, args: &[&str]) {
     let program = program.to_path_buf();
     let args: Vec<String> = args.iter().copied().map(String::from).collect();
@@ -55,7 +54,6 @@ pub fn spawn_detached(program: &Path, args: &[&str]) {
 }
 
 /// Copy `text` to the Wayland clipboard via `wl-copy` stdin.
-#[cfg_attr(test, expect(dead_code, reason = "wired into main in Task 7"))]
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     let mut child = Command::new("wl-copy")
         .stdin(Stdio::piped())
@@ -85,20 +83,17 @@ pub fn pactl_muted(stdout: &str) -> bool {
     stdout.contains("Mute: yes")
 }
 
-#[cfg_attr(test, expect(dead_code, reason = "wired into main in Task 7"))]
 enum MuteRequest {
     Set(bool),
     Restore(mpsc::Sender<()>),
 }
 
 /// Sequential worker that mutes and restores the default audio sink.
-#[cfg_attr(test, expect(dead_code, reason = "wired into main in Task 7"))]
 #[derive(Debug)]
 pub struct Muter {
     tx: mpsc::Sender<MuteRequest>,
 }
 
-#[cfg_attr(test, expect(dead_code, reason = "wired into main in Task 7"))]
 impl Muter {
     /// Start the background audio muter worker thread.
     pub fn spawn() -> Self {
@@ -111,6 +106,7 @@ impl Muter {
                     MuteRequest::Set(false) => unmute_sink(&mut muted_by_tray),
                     MuteRequest::Restore(ack) => {
                         unmute_sink(&mut muted_by_tray);
+                        // The sink is already restored; nothing more to do if the caller dropped ack_rx.
                         let _ = ack.send(());
                     }
                 }
@@ -121,19 +117,24 @@ impl Muter {
 
     /// Queue a mute or unmute request.
     pub fn set(&self, mute: bool) {
-        let _ = self.tx.send(MuteRequest::Set(mute));
+        if self.tx.send(MuteRequest::Set(mute)).is_err() {
+            warn!(mute, "audio muter worker thread is gone");
+        }
     }
 
     /// Restore the sink if muted by the tray and wait for completion.
     pub fn restore(&self) {
         let (ack_tx, ack_rx) = mpsc::channel();
-        if self.tx.send(MuteRequest::Restore(ack_tx)).is_ok() {
-            let _ = ack_rx.recv();
+        if self.tx.send(MuteRequest::Restore(ack_tx)).is_err() {
+            warn!("audio muter worker thread is gone; cannot restore audio sink");
+            return;
+        }
+        if ack_rx.recv().is_err() {
+            warn!("audio muter worker thread exited before confirming restore");
         }
     }
 }
 
-#[cfg_attr(test, expect(dead_code, reason = "wired into main in Task 7"))]
 fn mute_sink(muted_by_tray: &mut bool) {
     if let Some(stdout) = capture_stdout("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
         if wpctl_muted(&stdout) {
@@ -162,7 +163,6 @@ fn mute_sink(muted_by_tray: &mut bool) {
     warn!("failed to mute audio sink: neither wpctl nor pactl succeeded");
 }
 
-#[cfg_attr(test, expect(dead_code, reason = "wired into main in Task 7"))]
 fn unmute_sink(muted_by_tray: &mut bool) {
     if !*muted_by_tray {
         return;
@@ -179,7 +179,6 @@ fn unmute_sink(muted_by_tray: &mut bool) {
     warn!("failed to restore audio sink: neither wpctl nor pactl succeeded");
 }
 
-#[cfg_attr(test, expect(dead_code, reason = "wired into main in Task 7"))]
 fn capture_stdout(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program)
         .args(args)
@@ -193,7 +192,6 @@ fn capture_stdout(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-#[cfg_attr(test, expect(dead_code, reason = "wired into main in Task 7"))]
 fn run_quiet(program: &str, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
