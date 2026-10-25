@@ -18,7 +18,7 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
-signal-hook = "0.4"
+signal-hook = { workspace = true }
 ureq = "3"
 hound = "3"
 strsim = "0.11"

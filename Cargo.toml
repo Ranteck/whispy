@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/common", "crates/daemon", "crates/client"]
+members = ["crates/common", "crates/daemon", "crates/client", "crates/tray"]
 
 [workspace.package]
 version = "0.3.1"
@@ -23,6 +23,8 @@ clap = { version = "4", features = ["derive"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+ldtray = "0.1.2"
+signal-hook = "0.4"
 
 # Lints shared by every crate (each opts in with `[lints] workspace = true`).
 # `cargo clippy` picks these up automatically; CI runs it with `-D warnings`, so
