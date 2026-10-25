@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::Path;
 
 /// One accepted transcript from `transcripts.jsonl`.
@@ -33,16 +33,29 @@ pub fn recent(path: &Path, limit: usize) -> Vec<Transcript> {
         return Vec::new();
     }
 
-    let Ok(file) = File::open(path) else {
-        return Vec::new();
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            if err.kind() != ErrorKind::NotFound {
+                tracing::warn!(error_kind = ?err.kind(), "cannot open transcripts");
+            }
+            return Vec::new();
+        }
     };
 
     let reader = BufReader::new(file);
     let mut ring = VecDeque::with_capacity(limit);
 
     for line in reader.lines() {
-        let Ok(line) = line else {
-            continue;
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                if err.kind() == ErrorKind::InvalidData {
+                    continue;
+                }
+                tracing::warn!(error_kind = ?err.kind(), "stopped reading transcripts");
+                break;
+            }
         };
         let line = line.trim();
         if line.is_empty() {
@@ -179,5 +192,33 @@ mod tests {
     fn recent_missing_file_returns_empty() {
         let results = recent(Path::new("/nonexistent/whispy/transcripts.jsonl"), 10);
         assert_eq!(results, []);
+    }
+
+    #[test]
+    fn recent_on_directory_returns_empty() {
+        let temp = TempDir::new("recent-dir");
+        let results = recent(temp.path(), 10);
+        assert_eq!(results, []);
+    }
+
+    #[test]
+    fn skips_invalid_utf8_lines() {
+        use std::io::Write as _;
+        let temp = TempDir::new("invalid-utf8");
+        let log = temp.path().join("transcripts.jsonl");
+
+        let mut file = File::create(&log).expect("create file");
+        file.write_all(b"{\"text\": \"first\", \"timestamp\": 1.0, \"accepted\": true}\n")
+            .expect("write line 1");
+        file.write_all(&[0xff, 0xff, b'\n'])
+            .expect("write invalid utf8");
+        file.write_all(b"{\"text\": \"second\", \"timestamp\": 2.0, \"accepted\": true}\n")
+            .expect("write line 2");
+        drop(file);
+
+        let results = recent(&log, 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].text, "second");
+        assert_eq!(results[1].text, "first");
     }
 }
