@@ -78,7 +78,7 @@ whispy-daemon setup       # finish the one-time bootstrap
 
 ```sh
 cargo build --release --locked
-install -Dm755 target/release/whispy-{daemon,client} -t ~/.local/bin
+install -Dm755 target/release/whispy-{daemon,client,tray} -t ~/.local/bin
 whispy-daemon setup
 ```
 
@@ -108,6 +108,29 @@ with `whispy-daemon setup keybinds` (see
 [`docs/hyprland-setup.md`](docs/hyprland-setup.md); X11/GNOME equivalents under
 [Non-Hyprland](#non-hyprland-x11-and-generic-wayland)). Re-run `whispy-daemon setup verify` any
 time to check that the model, daemon, `ydotoold`, and whisper-server are all up.
+
+### Tray indicator (optional)
+
+`whispy-tray` is an optional StatusNotifierItem (`org.kde.StatusNotifierItem`) system tray
+companion that reflects live daemon state (`idle`, `recording`, `transcribing`, `error`). Enable
+it manually:
+
+```sh
+systemctl --user enable --now whispy-tray.service
+```
+
+- **Left click** — toggle dictation (`whispy-client toggle`).
+- **Middle click** — cancel dictation (`whispy-client cancel`).
+- **Right click** — open the tray menu (start/stop, cancel, recent transcript history,
+  `stt.language` switcher, open `config.toml`, restart `whispy-daemon`, quit).
+
+Optional tray keys in `$XDG_CONFIG_HOME/whispy/config.toml`:
+
+- `audio.mute_playback` (default `false`) — mute the default audio sink while `recording`
+  (`wpctl`, falling back to `pactl`) and restore it on leaving `recording` or quitting, only if
+  the tray muted it.
+- `injection.save_clipboard` (default `true`; `audio.save_clipboard` is also accepted) — copy
+  the latest accepted transcript to the Wayland clipboard (`wl-copy`) after dictation finishes.
 
 ## How it works
 

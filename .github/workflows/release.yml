@@ -24,7 +24,7 @@ jobs:
           # The two whispy binaries only. whisper-server and the model are NOT
           # shipped — `whispy-daemon setup` bootstraps them per-machine.
           mkdir -p dist
-          cp target/release/whispy-daemon target/release/whispy-client dist/
+          cp target/release/whispy-daemon target/release/whispy-client target/release/whispy-tray dist/
           cp README.md LICENSE dist/
           tar -czf "whispy-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C dist .
           sha256sum whispy-*.tar.gz > SHA256SUMS

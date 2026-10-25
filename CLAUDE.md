@@ -59,6 +59,7 @@ Cargo workspace (`resolver = "3"`, `edition = "2024"`, MSRV `rust-version = 1.88
 | `whispy-common` | `crates/common/` | Shared IPC protocol + state types (`Cmd`, `Resp`, `State`, `StateSnapshot`). Serde only, no logic. |
 | `whispy-daemon` | `crates/daemon/` | The resident service and the `setup` bootstrap. All the real logic. |
 | `whispy-client` | `crates/client/` | Thin sync client invoked from Hyprland binds. |
+| `whispy-tray` | `crates/tray/` | Optional StatusNotifierItem system tray indicator (`ldtray`, sync); polls `state.json`, provides click actions and tray menu. |
 
 ### Daemon modules (`crates/daemon/src/`)
 
@@ -169,6 +170,7 @@ binaries (not whisper-server/model), publish a GitHub release, and push to the A
 - `ui/omarchy/` — Omarchy bar widget plugin (`manifest.json`, `whispy.qml`) plus `tests/` (qmltestrunner with
   stub Quickshell modules and a mock `bar`).
 - `systemd/whispy-daemon.service` — user unit (installed by `setup`).
+- `systemd/whispy-tray.service` — optional user unit for `whispy-tray` (`crates/tray/`, enabled manually).
 - `packaging/aur/` — AUR `PKGBUILD`s (`whispy` release + `whispy-git`).
 - `scripts/` — `benchmark.sh` (STT latency per model), `setup-ydotool.sh`.
 - `docs/` — `hyprland-setup.md`, `stt-benchmark.md`, `spike-fork-vs-build.md`.

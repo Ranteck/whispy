@@ -9,7 +9,7 @@ license=('MIT')
 # `whispy-daemon setup` builds whisper.cpp on first run; with vulkan-icd-loader
 # present it builds the Vulkan backend, which needs cmake, glslc (shaderc) and the
 # Vulkan + SPIR-V headers, so those are hard dependencies.
-depends=('pipewire' 'wl-clipboard' 'ydotool' 'libnotify' 'vulkan-icd-loader'
+depends=('pipewire' 'wl-clipboard' 'ydotool' 'libnotify' 'dbus' 'vulkan-icd-loader'
          'git' 'cmake' 'shaderc' 'vulkan-headers' 'spirv-headers')
 makedepends=('rust' 'cargo' 'git')
 optdepends=('quickshell: dictation pill overlay UI (Wayland layer-shell)'
@@ -59,11 +59,16 @@ package() {
 
   install -Dm755 target/release/whispy-daemon "$pkgdir/usr/bin/whispy-daemon"
   install -Dm755 target/release/whispy-client "$pkgdir/usr/bin/whispy-client"
+  install -Dm755 target/release/whispy-tray "$pkgdir/usr/bin/whispy-tray"
 
   install -Dm644 systemd/whispy-daemon.service \
     "$pkgdir/usr/lib/systemd/user/whispy-daemon.service"
   sed -i 's|^ExecStart=.*|ExecStart=/usr/bin/whispy-daemon|' \
     "$pkgdir/usr/lib/systemd/user/whispy-daemon.service"
+  install -Dm644 systemd/whispy-tray.service \
+    "$pkgdir/usr/lib/systemd/user/whispy-tray.service"
+  sed -i 's|^ExecStart=.*|ExecStart=/usr/bin/whispy-tray|' \
+    "$pkgdir/usr/lib/systemd/user/whispy-tray.service"
 
   install -Dm644 systemd/ydotoold.service \
     "$pkgdir/usr/lib/systemd/user/ydotoold.service"

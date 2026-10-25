@@ -38,7 +38,8 @@ install_from_source() {
   ( cd "$repo_root" && cargo build --release --locked )
   install -Dm755 "$repo_root/target/release/whispy-daemon" "$prefix/bin/whispy-daemon"
   install -Dm755 "$repo_root/target/release/whispy-client" "$prefix/bin/whispy-client"
-  echo "Installed whispy-daemon and whispy-client to $prefix/bin"
+  install -Dm755 "$repo_root/target/release/whispy-tray" "$prefix/bin/whispy-tray"
+  echo "Installed whispy-daemon, whispy-client, and whispy-tray to $prefix/bin"
   whispy_daemon_bin="$prefix/bin/whispy-daemon"
   case ":$PATH:" in
     *":$prefix/bin:"*) ;;
