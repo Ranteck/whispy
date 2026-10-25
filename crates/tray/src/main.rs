@@ -260,16 +260,18 @@ fn copy_history_entry(handle: &TrayHandle, history: &[Transcript], index: usize)
         );
         return;
     };
-    match system::copy_to_clipboard(text) {
+    let text = text.to_owned();
+    let handle = handle.clone();
+    std::thread::spawn(move || match system::copy_to_clipboard(&text) {
         Ok(()) => {
             info!(
                 action = "copy_history",
                 index, "copied transcript from history"
             );
             send_notification(
-                handle,
+                &handle,
                 "Copied to clipboard",
-                history::preview(text, COPY_PREVIEW_MAX_CHARS),
+                history::preview(&text, COPY_PREVIEW_MAX_CHARS),
                 Kind::Idle,
             );
         }
@@ -281,7 +283,7 @@ fn copy_history_entry(handle: &TrayHandle, history: &[Transcript], index: usize)
                 "failed to copy transcript to clipboard"
             );
         }
-    }
+    });
 }
 
 fn apply_language_change(
@@ -375,11 +377,14 @@ fn run_auto_copy(transcripts_path: &Path, last_copied: &mut f64) {
     let recent = history::recent(transcripts_path, 1);
     if let Some((text, timestamp)) = next_auto_copy(&recent, *last_copied) {
         *last_copied = timestamp;
-        if let Err(error) = system::copy_to_clipboard(text) {
-            warn!(%error, timestamp, "failed to auto-copy latest transcript to clipboard");
-        } else {
-            debug!(timestamp, "auto-copied latest transcript to clipboard");
-        }
+        let text = text.to_owned();
+        std::thread::spawn(move || {
+            if let Err(error) = system::copy_to_clipboard(&text) {
+                warn!(%error, timestamp, "failed to auto-copy latest transcript to clipboard");
+            } else {
+                debug!(timestamp, "auto-copied latest transcript to clipboard");
+            }
+        });
     }
 }
 
