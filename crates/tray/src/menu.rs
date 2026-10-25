@@ -18,6 +18,7 @@ const ID_LANG_AUTO: u32 = 6;
 const ID_EDIT_CONFIG: u32 = 7;
 const ID_RESTART_DAEMON: u32 = 8;
 const ID_QUIT: u32 = 9;
+const ID_EMPTY_HISTORY: u32 = 10;
 const ID_COPY_BASE: u32 = 100;
 
 /// Action triggered by clicking an enabled tray menu item.
@@ -72,7 +73,7 @@ pub fn build(kind: Kind, history: &[Transcript], language: Language) -> Menu {
 
 fn history_items(history: &[Transcript]) -> Vec<MenuItem> {
     if history.is_empty() {
-        return vec![MenuItem::button(ID_DISABLED, "(No recent recordings)").enabled(false)];
+        return vec![MenuItem::button(ID_EMPTY_HISTORY, "(No recent recordings)").enabled(false)];
     }
 
     let mut items = Vec::with_capacity(history.len() + 2);
@@ -136,6 +137,33 @@ mod tests {
                 timestamp: 10.0,
             },
         ]
+    }
+
+    #[test]
+    fn all_button_ids_are_unique() {
+        fn check_buttons(items: &[MenuItem], seen: &mut std::collections::HashSet<u32>) {
+            for item in items {
+                match item {
+                    MenuItem::Button { id, enabled, .. } => {
+                        assert!(seen.insert(id.0), "duplicate button ID: {}", id.0);
+                        assert_eq!(action(*id).is_some(), *enabled);
+                    }
+                    MenuItem::Submenu { items, .. } => check_buttons(items, seen),
+                    MenuItem::Separator => {}
+                }
+            }
+        }
+
+        let full_history: Vec<_> = (0..10)
+            .map(|index| Transcript {
+                text: format!("Recording {index}"),
+                timestamp: f64::from(index),
+            })
+            .collect();
+        for history in [&[][..], full_history.as_slice()] {
+            let menu = build(Kind::Idle, history, Language::Auto);
+            check_buttons(menu.items(), &mut std::collections::HashSet::new());
+        }
     }
 
     #[test]

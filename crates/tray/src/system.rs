@@ -170,6 +170,11 @@ enum MuteRequest {
     Restore(mpsc::Sender<()>),
 }
 
+enum MutedSink {
+    Wpctl(u32),
+    Pactl(String),
+}
+
 /// Sequential worker that mutes and restores the default audio sink.
 #[derive(Debug)]
 pub struct Muter {
@@ -187,7 +192,7 @@ impl Muter {
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut muted_by_tray = false;
+            let mut muted_by_tray = None;
             for req in rx {
                 match req {
                     MuteRequest::Set(true) => mute_sink(&mut muted_by_tray, &mut run),
@@ -233,25 +238,45 @@ impl Muter {
     }
 }
 
-fn mute_sink(muted_by_tray: &mut bool, run: &mut impl FnMut(&str, &[&str]) -> io::Result<String>) {
-    if let Ok(stdout) = run("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
+fn mute_sink(
+    muted_by_tray: &mut Option<MutedSink>,
+    run: &mut impl FnMut(&str, &[&str]) -> io::Result<String>,
+) {
+    if muted_by_tray.is_some() {
+        return;
+    }
+    if let Ok(stdout) = run("wpctl", &["inspect", "@DEFAULT_AUDIO_SINK@"])
+        && let Some(id) = stdout
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("id "))
+            .and_then(|line| line.split_once(','))
+            .and_then(|(id, _)| id.parse::<u32>().ok())
+        && let Ok(stdout) = run("wpctl", &["get-volume", &id.to_string()])
+    {
         if wpctl_muted(&stdout) {
             debug!(tool = "wpctl", "audio sink already muted");
             return;
         }
-        if run("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "1"]).is_ok() {
-            *muted_by_tray = true;
+        if run("wpctl", &["set-mute", &id.to_string(), "1"]).is_ok() {
+            *muted_by_tray = Some(MutedSink::Wpctl(id));
             debug!(tool = "wpctl", "muted audio sink");
             return;
         }
     }
-    if let Ok(stdout) = run("pactl", &["get-sink-mute", "@DEFAULT_SINK@"]) {
+    if let Ok(stdout) = run("pactl", &["get-default-sink"])
+        && let name = stdout.trim()
+        && !name.is_empty()
+        && !name.starts_with('-')
+        && !name.contains(char::is_whitespace)
+        && let Ok(stdout) = run("pactl", &["get-sink-mute", name])
+    {
         if pactl_muted(&stdout) {
             debug!(tool = "pactl", "audio sink already muted");
             return;
         }
-        if run("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "1"]).is_ok() {
-            *muted_by_tray = true;
+        if run("pactl", &["set-sink-mute", name, "1"]).is_ok() {
+            *muted_by_tray = Some(MutedSink::Pactl(name.to_owned()));
             debug!(tool = "pactl", "muted audio sink");
             return;
         }
@@ -260,23 +285,23 @@ fn mute_sink(muted_by_tray: &mut bool, run: &mut impl FnMut(&str, &[&str]) -> io
 }
 
 fn unmute_sink(
-    muted_by_tray: &mut bool,
+    muted_by_tray: &mut Option<MutedSink>,
     run: &mut impl FnMut(&str, &[&str]) -> io::Result<String>,
 ) {
-    if !*muted_by_tray {
+    let Some(sink) = muted_by_tray.as_ref() else {
         return;
+    };
+    let (tool, result) = match sink {
+        MutedSink::Wpctl(id) => ("wpctl", run("wpctl", &["set-mute", &id.to_string(), "0"])),
+        MutedSink::Pactl(name) => ("pactl", run("pactl", &["set-sink-mute", name, "0"])),
+    };
+    match result {
+        Ok(_) => {
+            *muted_by_tray = None;
+            debug!(tool, "restored audio sink");
+        }
+        Err(error) => warn!(tool, %error, "failed to restore audio sink"),
     }
-    if run("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]).is_ok() {
-        *muted_by_tray = false;
-        debug!(tool = "wpctl", "restored audio sink");
-        return;
-    }
-    if run("pactl", &["set-sink-mute", "@DEFAULT_SINK@", "0"]).is_ok() {
-        *muted_by_tray = false;
-        debug!(tool = "pactl", "restored audio sink");
-        return;
-    }
-    warn!("failed to restore audio sink: neither wpctl nor pactl succeeded");
 }
 
 fn run_audio_command(program: &str, args: &[&str]) -> io::Result<String> {
@@ -368,12 +393,15 @@ mod tests {
         let muter = Muter::spawn_with_runner(move |program, args| {
             let mut state = state.lock().expect("sink lock");
             match (program, args) {
-                ("wpctl", ["get-volume", "@DEFAULT_AUDIO_SINK@"]) => Ok("Volume: 1.00".into()),
-                ("wpctl", ["set-mute", "@DEFAULT_AUDIO_SINK@", "1"]) => {
+                ("wpctl", ["inspect", "@DEFAULT_AUDIO_SINK@"]) => {
+                    Ok("id 42, type PipeWire:Interface:Node\n".into())
+                }
+                ("wpctl", ["get-volume", "42"]) => Ok("Volume: 1.00".into()),
+                ("wpctl", ["set-mute", "42", "1"]) => {
                     state.0 = true;
                     Ok(String::new())
                 }
-                ("wpctl", ["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]) => {
+                ("wpctl", ["set-mute", "42", "0"]) => {
                     state.1 += 1;
                     if state.1 == 1 {
                         Err(io::Error::other("temporary restore failure"))
@@ -382,9 +410,6 @@ mod tests {
                         Ok(String::new())
                     }
                 }
-                ("pactl", ["set-sink-mute", "@DEFAULT_SINK@", "0"]) => {
-                    Err(io::Error::other("fallback unavailable"))
-                }
                 _ => panic!("unexpected audio command: {program} {args:?}"),
             }
         });
@@ -392,6 +417,117 @@ mod tests {
         muter.set(false);
         muter.restore();
         assert_eq!(*sink.lock().expect("sink lock"), (false, 2));
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Sinks {
+        default: usize,
+        muted: [bool; 2],
+        transitions: Vec<(usize, bool)>,
+    }
+
+    fn changing_default_muter(
+        tool: &'static str,
+        replacement_muted: bool,
+    ) -> (Muter, std::sync::Arc<std::sync::Mutex<Sinks>>) {
+        let sinks = std::sync::Arc::new(std::sync::Mutex::new(Sinks {
+            default: 0,
+            muted: [false, replacement_muted],
+            transitions: Vec::new(),
+        }));
+        let state = std::sync::Arc::clone(&sinks);
+        let muter = Muter::spawn_with_runner(move |program, args| {
+            if program != tool {
+                return Err(io::Error::other("tool unavailable"));
+            }
+            let mut state = state.lock().expect("sink state lock");
+            let names = if tool == "wpctl" {
+                ["42", "99"]
+            } else {
+                ["alsa_output.speakers", "bluez_output.headset"]
+            };
+            match args {
+                ["inspect", "@DEFAULT_AUDIO_SINK@"] => Ok(format!(
+                    "id {}, type PipeWire:Interface:Node\n",
+                    names[state.default]
+                )),
+                ["get-default-sink"] => Ok(format!("{}\n", names[state.default])),
+                [command, target] | [command, target, _] => {
+                    let index = if target.starts_with('@') {
+                        state.default
+                    } else {
+                        names
+                            .iter()
+                            .position(|name| name == target)
+                            .expect("known sink")
+                    };
+                    match *command {
+                        "get-volume" => Ok(if state.muted[index] {
+                            "Volume: 0.75 [MUTED]\n".into()
+                        } else {
+                            "Volume: 0.75\n".into()
+                        }),
+                        "get-sink-mute" => Ok(if state.muted[index] {
+                            "Mute: yes\n".into()
+                        } else {
+                            "Mute: no\n".into()
+                        }),
+                        "set-mute" | "set-sink-mute" => {
+                            let muted = args[2] == "1";
+                            state.muted[index] = muted;
+                            state.transitions.push((index, muted));
+                            if muted && index == 0 {
+                                state.default = 1;
+                            }
+                            Ok(String::new())
+                        }
+                        _ => panic!("unexpected audio command: {program} {args:?}"),
+                    }
+                }
+                _ => panic!("unexpected audio command: {program} {args:?}"),
+            }
+        });
+        (muter, sinks)
+    }
+
+    #[test]
+    fn default_change_restores_the_originally_muted_sink() {
+        for tool in ["wpctl", "pactl"] {
+            let (muter, sinks) = changing_default_muter(tool, false);
+            muter.set(true);
+            muter.set(false);
+            muter.restore();
+            assert_eq!(
+                *sinks.lock().expect("sink state lock"),
+                Sinks {
+                    default: 1,
+                    muted: [false, false],
+                    transitions: vec![(0, true), (0, false)],
+                },
+                "{tool} must restore the original sink without touching the new default"
+            );
+        }
+    }
+
+    #[test]
+    fn premuted_new_default_stays_muted() {
+        for tool in ["wpctl", "pactl"] {
+            let (muter, sinks) = changing_default_muter(tool, true);
+            muter.set(true);
+            muter.set(false);
+            muter.set(true);
+            muter.set(false);
+            muter.restore();
+            assert_eq!(
+                *sinks.lock().expect("sink state lock"),
+                Sinks {
+                    default: 1,
+                    muted: [false, true],
+                    transitions: vec![(0, true), (0, false)],
+                },
+                "{tool} must leave the pre-muted replacement untouched across recordings"
+            );
+        }
     }
 
     #[test]

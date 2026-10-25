@@ -31,6 +31,13 @@ const AUTO_COPY_DELAY: Duration = Duration::from_millis(100);
 const HISTORY_LIMIT: usize = 10;
 const COPY_PREVIEW_MAX_CHARS: usize = 55;
 
+fn poll_wait(now: Instant, next_poll: Instant, pending_copy: Option<Instant>) -> Duration {
+    next_poll
+        .min(pending_copy.unwrap_or(next_poll))
+        .saturating_duration_since(now)
+        .min(POLL_INTERVAL)
+}
+
 fn main() -> ExitCode {
     init_logging();
     match run() {
@@ -54,6 +61,7 @@ fn init_logging() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let paths = Paths::from_env(|key| std::env::var(key).ok());
+    // Without the executable path, client_path still resolves whispy-client through PATH.
     let exe = std::env::current_exe().unwrap_or_default();
     let client = system::client_path(&exe, Path::exists);
     let mut last_copied = history::recent(&paths.transcripts, 1)
@@ -93,35 +101,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut quit_by_menu = false;
+    let mut next_poll = Instant::now() + POLL_INTERVAL;
     while !shutdown.load(Ordering::Relaxed) {
-        match event_rx.recv_timeout(POLL_INTERVAL) {
+        match event_rx.recv_timeout(poll_wait(Instant::now(), next_poll, pending_copy)) {
             Ok(event) => {
                 if handle_event(event, &paths, &client, &handle, current_key.0, &mut history) {
                     quit_by_menu = true;
                     break;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                poll_state(
-                    &paths,
-                    &handle,
-                    &muter,
-                    &mut current_key,
-                    &mut history,
-                    &mut pending_copy,
-                );
-                if pending_copy.is_some_and(|deadline| Instant::now() >= deadline) {
-                    pending_copy = None;
-                    run_auto_copy(&paths.transcripts, &mut last_copied);
-                }
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 muter.restore();
                 return Err("tray event channel disconnected".into());
             }
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        if Instant::now() >= next_poll {
+            poll_state(
+                &paths,
+                &handle,
+                &muter,
+                &mut current_key,
+                &mut history,
+                &mut pending_copy,
+            );
+            next_poll = Instant::now() + POLL_INTERVAL;
+        }
+        if pending_copy.is_some_and(|deadline| Instant::now() >= deadline) {
+            pending_copy = None;
+            run_auto_copy(&paths.transcripts, &mut last_copied);
         }
     }
 
@@ -413,6 +424,48 @@ fn language_switched_body(lang: Language) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_wait_never_exceeds_interval() {
+        let now = Instant::now();
+        for (until_poll, expected) in [(25, 25), (50, 50), (500, 50)] {
+            assert_eq!(
+                poll_wait(now, now + Duration::from_millis(until_poll), None),
+                Duration::from_millis(expected)
+            );
+        }
+        assert_eq!(
+            poll_wait(
+                now,
+                now + POLL_INTERVAL,
+                Some(now + Duration::from_millis(10))
+            ),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            poll_wait(now, now + POLL_INTERVAL, Some(now)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn polls_even_under_continuous_events() {
+        let start = Instant::now();
+        let next_poll = start + POLL_INTERVAL;
+        for elapsed_ms in 0..=75 {
+            let now = start + Duration::from_millis(elapsed_ms);
+            let wait = poll_wait(now, next_poll, None);
+            if elapsed_ms < 50 {
+                assert_eq!(wait, Duration::from_millis(50 - elapsed_ms));
+            } else {
+                assert_eq!(
+                    wait,
+                    Duration::ZERO,
+                    "event at {elapsed_ms} ms must not delay polling"
+                );
+            }
+        }
+    }
 
     #[test]
     fn next_auto_copy_trims_and_requires_newer_timestamp() {
