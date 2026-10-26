@@ -487,24 +487,35 @@ mod tests {
         cfg.audio
     }
 
-    fn make_au_header(be: bool, offset: u32) -> Vec<u8> {
+    fn make_custom_au_header(
+        be: bool,
+        offset: u32,
+        size: u32,
+        encoding: u32,
+        rate: u32,
+        channels: u32,
+    ) -> Vec<u8> {
         let mut header = Vec::with_capacity(24);
+        let magic = if be { b".snd" } else { b"dns." };
+        header.extend_from_slice(magic);
         if be {
-            header.extend_from_slice(b".snd");
             header.extend_from_slice(&offset.to_be_bytes());
-            header.extend_from_slice(&0xffff_ffffu32.to_be_bytes());
-            header.extend_from_slice(&3u32.to_be_bytes());
-            header.extend_from_slice(&16000u32.to_be_bytes());
-            header.extend_from_slice(&1u32.to_be_bytes());
+            header.extend_from_slice(&size.to_be_bytes());
+            header.extend_from_slice(&encoding.to_be_bytes());
+            header.extend_from_slice(&rate.to_be_bytes());
+            header.extend_from_slice(&channels.to_be_bytes());
         } else {
-            header.extend_from_slice(b"dns.");
             header.extend_from_slice(&offset.to_le_bytes());
-            header.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-            header.extend_from_slice(&3u32.to_le_bytes());
-            header.extend_from_slice(&16000u32.to_le_bytes());
-            header.extend_from_slice(&1u32.to_le_bytes());
+            header.extend_from_slice(&size.to_le_bytes());
+            header.extend_from_slice(&encoding.to_le_bytes());
+            header.extend_from_slice(&rate.to_le_bytes());
+            header.extend_from_slice(&channels.to_le_bytes());
         }
         header
+    }
+
+    fn make_au_header(be: bool, offset: u32) -> Vec<u8> {
+        make_custom_au_header(be, offset, 0xffff_ffff, 3, 16000, 1)
     }
 
     struct ChunkedReader<R> {
@@ -579,42 +590,14 @@ mod tests {
         assert_eq!(samples.len(), 1600);
     }
 
-    fn make_custom_au_header(
-        be: bool,
-        offset: u32,
-        size: u32,
-        encoding: u32,
-        rate: u32,
-        channels: u32,
-    ) -> Vec<u8> {
-        let mut header = Vec::with_capacity(24);
-        let magic = if be { b".snd" } else { b"dns." };
-        header.extend_from_slice(magic);
-        if be {
-            header.extend_from_slice(&offset.to_be_bytes());
-            header.extend_from_slice(&size.to_be_bytes());
-            header.extend_from_slice(&encoding.to_be_bytes());
-            header.extend_from_slice(&rate.to_be_bytes());
-            header.extend_from_slice(&channels.to_be_bytes());
-        } else {
-            header.extend_from_slice(&offset.to_le_bytes());
-            header.extend_from_slice(&size.to_le_bytes());
-            header.extend_from_slice(&encoding.to_le_bytes());
-            header.extend_from_slice(&rate.to_le_bytes());
-            header.extend_from_slice(&channels.to_le_bytes());
-        }
-        header
-    }
-
     #[test]
     fn invalid_au_headers_fall_back_to_raw_little_endian() {
         let cfg = test_audio_config();
         let skip_samples = (u64::from(cfg.rate) * SKIP_MS / 1000) as usize;
 
         struct TestCase {
-            name: &'static str,
+            name: String,
             prefix: Vec<u8>,
-            has_payload: bool,
         }
 
         let mut cases = Vec::new();
@@ -625,7 +608,7 @@ mod tests {
             // Invalid offsets.
             for &offset in &[0, 1, 23, 25, u32::MAX] {
                 cases.push(TestCase {
-                    name: Box::leak(format!("{magic_name} offset {offset}").into_boxed_str()),
+                    name: format!("{magic_name} offset {offset}"),
                     prefix: make_custom_au_header(
                         be,
                         offset,
@@ -634,13 +617,12 @@ mod tests {
                         cfg.rate,
                         u32::from(cfg.channels),
                     ),
-                    has_payload: true,
                 });
             }
 
             // Wrong encoding (with offset 24).
             cases.push(TestCase {
-                name: Box::leak(format!("{magic_name} wrong encoding").into_boxed_str()),
+                name: format!("{magic_name} wrong encoding"),
                 prefix: make_custom_au_header(
                     be,
                     24,
@@ -649,12 +631,11 @@ mod tests {
                     cfg.rate,
                     u32::from(cfg.channels),
                 ),
-                has_payload: true,
             });
 
             // Wrong rate (with offset 24).
             cases.push(TestCase {
-                name: Box::leak(format!("{magic_name} wrong rate").into_boxed_str()),
+                name: format!("{magic_name} wrong rate"),
                 prefix: make_custom_au_header(
                     be,
                     24,
@@ -663,12 +644,11 @@ mod tests {
                     cfg.rate + 1,
                     u32::from(cfg.channels),
                 ),
-                has_payload: true,
             });
 
             // Wrong channels (with offset 24).
             cases.push(TestCase {
-                name: Box::leak(format!("{magic_name} wrong channels").into_boxed_str()),
+                name: format!("{magic_name} wrong channels"),
                 prefix: make_custom_au_header(
                     be,
                     24,
@@ -677,38 +657,13 @@ mod tests {
                     cfg.rate,
                     u32::from(cfg.channels) + 1,
                 ),
-                has_payload: true,
             });
         }
 
-        // Truncated (<24 byte) magic-prefixed candidates.
-        cases.push(TestCase {
-            name: "be truncated 4 bytes",
-            prefix: b".snd".to_vec(),
-            has_payload: false,
-        });
-        cases.push(TestCase {
-            name: "be truncated 8 bytes",
-            prefix: b".snd\0\0\0\x18".to_vec(),
-            has_payload: false,
-        });
-        cases.push(TestCase {
-            name: "le truncated 4 bytes",
-            prefix: b"dns.".to_vec(),
-            has_payload: false,
-        });
-        cases.push(TestCase {
-            name: "le truncated 8 bytes",
-            prefix: b"dns.\x18\0\0\0".to_vec(),
-            has_payload: false,
-        });
-
         for tc in cases {
             let mut stream = tc.prefix;
-            if tc.has_payload {
-                for i in 0..2400i16 {
-                    stream.extend_from_slice(&i.to_le_bytes());
-                }
+            for i in 0..2400i16 {
+                stream.extend_from_slice(&i.to_le_bytes());
             }
 
             let expected: Vec<i16> = stream
@@ -721,6 +676,38 @@ mod tests {
 
             let samples = read_loop(&stream[..], &cfg, Signals::default(), |_| {}, || {}, || {});
             assert_eq!(samples, expected, "failed for test case: {}", tc.name);
+        }
+    }
+
+    #[test]
+    fn truncated_au_candidate_waits_then_falls_back_to_raw() {
+        let cfg = test_audio_config();
+
+        for be in [true, false] {
+            let header = make_au_header(be, 24);
+
+            for len in 4..=23 {
+                let prefix = &header[..len];
+                assert_eq!(
+                    sniff_header(prefix, false, &cfg),
+                    None,
+                    "expected None for prefix len {len} with eof=false (be={be})"
+                );
+                assert_eq!(
+                    sniff_header(prefix, true, &cfg),
+                    Some((0, Endian::Little)),
+                    "expected fallback to raw for prefix len {len} with eof=true (be={be})"
+                );
+            }
+
+            for len in 1..=3 {
+                let prefix = &header[..len];
+                assert_eq!(
+                    sniff_header(prefix, false, &cfg),
+                    None,
+                    "expected None for magic prefix len {len} with eof=false (be={be})"
+                );
+            }
         }
     }
 
