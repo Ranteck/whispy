@@ -153,6 +153,9 @@ impl Capture {
     }
 }
 
+/// Standard AU container header length in bytes (magic + 5 u32 fields).
+const AU_HEADER_LEN: usize = 24;
+
 /// Byte order of incoming audio samples.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Endian {
@@ -160,30 +163,97 @@ enum Endian {
     Little,
 }
 
-/// Sniffs the start of the audio stream for an AU container or raw PCM.
-fn sniff_header(buf: &[u8]) -> Option<(&'static str, &'static str, usize, Endian)> {
-    if buf.len() < 8 {
-        return None;
+impl Endian {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Big => "big",
+            Self::Little => "little",
+        }
     }
-    // PipeWire 1.6.10+ writes AU in native big-endian (.snd); older versions wrote AU little-endian (dns.) or raw PCM.
-    if buf.starts_with(b".snd") {
-        let offset = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        Some((
-            "au",
-            "big",
-            usize::try_from(offset).unwrap_or(usize::MAX),
-            Endian::Big,
-        ))
+}
+
+/// Sniffs the start of the audio stream for a valid AU container or raw PCM.
+fn sniff_header(buf: &[u8], eof: bool, cfg: &Audio) -> Option<(usize, Endian)> {
+    // PipeWire 1.6.10+ writes AU in the container's big-endian byte order (.snd);
+    // older versions wrote AU little-endian (dns.) or raw PCM.
+    let endian = if buf.starts_with(b".snd") {
+        Some(Endian::Big)
     } else if buf.starts_with(b"dns.") {
-        let offset = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        Some((
-            "au",
-            "little",
-            usize::try_from(offset).unwrap_or(usize::MAX),
-            Endian::Little,
-        ))
+        Some(Endian::Little)
     } else {
-        Some(("raw", "little", 0, Endian::Little))
+        None
+    };
+
+    let Some(endian) = endian else {
+        // If the buffer cannot yet be ruled out as an AU magic prefix and more data may arrive, wait.
+        if !eof && buf.len() < 4 && (b".snd".starts_with(buf) || b"dns.".starts_with(buf)) {
+            return None;
+        }
+        return Some((0, Endian::Little));
+    };
+
+    if buf.len() < AU_HEADER_LEN {
+        if !eof {
+            return None;
+        }
+        // Legacy raw PCM can start with bytes that look like AU magic.
+        warn!(
+            fields = "header_len",
+            len = buf.len(),
+            expected = AU_HEADER_LEN,
+            "AU header candidate truncated; falling back to raw PCM"
+        );
+        return Some((0, Endian::Little));
+    }
+
+    let (offset, encoding, rate, channels) = match endian {
+        Endian::Big => (
+            u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]),
+        ),
+        Endian::Little => (
+            u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
+        ),
+    };
+
+    let offset_ok = offset == 24;
+    let encoding_ok = encoding == 3;
+    let rate_ok = rate == cfg.rate;
+    let channels_ok = channels == u32::from(cfg.channels);
+
+    if offset_ok && encoding_ok && rate_ok && channels_ok {
+        Some((AU_HEADER_LEN, endian))
+    } else {
+        let mut mismatched = Vec::new();
+        if !offset_ok {
+            mismatched.push("offset");
+        }
+        if !encoding_ok {
+            mismatched.push("encoding");
+        }
+        if !rate_ok {
+            mismatched.push("rate");
+        }
+        if !channels_ok {
+            mismatched.push("channels");
+        }
+        let fields = mismatched.join(", ");
+
+        // Legacy raw PCM can start with bytes that look like AU magic.
+        warn!(
+            fields = %fields,
+            offset,
+            encoding,
+            rate,
+            channels,
+            "invalid AU header; falling back to raw PCM"
+        );
+        Some((0, Endian::Little))
     }
 }
 
@@ -251,17 +321,15 @@ where
         };
 
         if !format_detected {
-            if let Some((container, byte_order, discard, end)) = sniff_header(&leftover) {
-                debug!(container, byte_order, "stream container detected");
-                header_discard = discard;
-                endian = end;
-                format_detected = true;
-            } else if eof {
+            if let Some((discard, end)) = sniff_header(&leftover, eof, cfg) {
+                let container = if discard > 0 { "au" } else { "raw" };
                 debug!(
-                    container = "raw",
-                    byte_order = "little",
+                    container,
+                    byte_order = end.as_str(),
                     "stream container detected"
                 );
+                header_discard = discard;
+                endian = end;
                 format_detected = true;
             } else {
                 continue;
@@ -509,5 +577,241 @@ mod tests {
             assert_eq!(s, 1000);
         }
         assert_eq!(samples.len(), 1600);
+    }
+
+    fn make_custom_au_header(
+        be: bool,
+        offset: u32,
+        size: u32,
+        encoding: u32,
+        rate: u32,
+        channels: u32,
+    ) -> Vec<u8> {
+        let mut header = Vec::with_capacity(24);
+        let magic = if be { b".snd" } else { b"dns." };
+        header.extend_from_slice(magic);
+        if be {
+            header.extend_from_slice(&offset.to_be_bytes());
+            header.extend_from_slice(&size.to_be_bytes());
+            header.extend_from_slice(&encoding.to_be_bytes());
+            header.extend_from_slice(&rate.to_be_bytes());
+            header.extend_from_slice(&channels.to_be_bytes());
+        } else {
+            header.extend_from_slice(&offset.to_le_bytes());
+            header.extend_from_slice(&size.to_le_bytes());
+            header.extend_from_slice(&encoding.to_le_bytes());
+            header.extend_from_slice(&rate.to_le_bytes());
+            header.extend_from_slice(&channels.to_le_bytes());
+        }
+        header
+    }
+
+    #[test]
+    fn invalid_au_headers_fall_back_to_raw_little_endian() {
+        let cfg = test_audio_config();
+        let skip_samples = (u64::from(cfg.rate) * SKIP_MS / 1000) as usize;
+
+        struct TestCase {
+            name: &'static str,
+            prefix: Vec<u8>,
+            has_payload: bool,
+        }
+
+        let mut cases = Vec::new();
+
+        for be in [true, false] {
+            let magic_name = if be { "be" } else { "le" };
+
+            // Invalid offsets.
+            for &offset in &[0, 1, 23, 25, u32::MAX] {
+                cases.push(TestCase {
+                    name: Box::leak(format!("{magic_name} offset {offset}").into_boxed_str()),
+                    prefix: make_custom_au_header(
+                        be,
+                        offset,
+                        0xffff_ffff,
+                        3,
+                        cfg.rate,
+                        u32::from(cfg.channels),
+                    ),
+                    has_payload: true,
+                });
+            }
+
+            // Wrong encoding (with offset 24).
+            cases.push(TestCase {
+                name: Box::leak(format!("{magic_name} wrong encoding").into_boxed_str()),
+                prefix: make_custom_au_header(
+                    be,
+                    24,
+                    0xffff_ffff,
+                    1,
+                    cfg.rate,
+                    u32::from(cfg.channels),
+                ),
+                has_payload: true,
+            });
+
+            // Wrong rate (with offset 24).
+            cases.push(TestCase {
+                name: Box::leak(format!("{magic_name} wrong rate").into_boxed_str()),
+                prefix: make_custom_au_header(
+                    be,
+                    24,
+                    0xffff_ffff,
+                    3,
+                    cfg.rate + 1,
+                    u32::from(cfg.channels),
+                ),
+                has_payload: true,
+            });
+
+            // Wrong channels (with offset 24).
+            cases.push(TestCase {
+                name: Box::leak(format!("{magic_name} wrong channels").into_boxed_str()),
+                prefix: make_custom_au_header(
+                    be,
+                    24,
+                    0xffff_ffff,
+                    3,
+                    cfg.rate,
+                    u32::from(cfg.channels) + 1,
+                ),
+                has_payload: true,
+            });
+        }
+
+        // Truncated (<24 byte) magic-prefixed candidates.
+        cases.push(TestCase {
+            name: "be truncated 4 bytes",
+            prefix: b".snd".to_vec(),
+            has_payload: false,
+        });
+        cases.push(TestCase {
+            name: "be truncated 8 bytes",
+            prefix: b".snd\0\0\0\x18".to_vec(),
+            has_payload: false,
+        });
+        cases.push(TestCase {
+            name: "le truncated 4 bytes",
+            prefix: b"dns.".to_vec(),
+            has_payload: false,
+        });
+        cases.push(TestCase {
+            name: "le truncated 8 bytes",
+            prefix: b"dns.\x18\0\0\0".to_vec(),
+            has_payload: false,
+        });
+
+        for tc in cases {
+            let mut stream = tc.prefix;
+            if tc.has_payload {
+                for i in 0..2400i16 {
+                    stream.extend_from_slice(&i.to_le_bytes());
+                }
+            }
+
+            let expected: Vec<i16> = stream
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .skip(skip_samples)
+                .map(|p| i16::from_le_bytes(*p))
+                .collect();
+
+            let samples = read_loop(&stream[..], &cfg, Signals::default(), |_| {}, || {}, || {});
+            assert_eq!(samples, expected, "failed for test case: {}", tc.name);
+        }
+    }
+
+    #[test]
+    fn au_big_endian_hits_max_duration() {
+        use std::cell::Cell;
+
+        let mut cfg = test_audio_config();
+        cfg.max_clip_secs = 0.1;
+        let max_samples = cfg.max_samples();
+        assert_eq!(max_samples, 1600);
+
+        let mut stream = make_au_header(true, 24);
+        for i in 0..3000i16 {
+            stream.extend_from_slice(&i.to_be_bytes());
+        }
+
+        let signals = Signals::default();
+        let too_long_count = Cell::new(0usize);
+        let silence_count = Cell::new(0usize);
+
+        let samples = read_loop(
+            &stream[..],
+            &cfg,
+            signals.clone(),
+            |_| {},
+            || too_long_count.set(too_long_count.get() + 1),
+            || silence_count.set(silence_count.get() + 1),
+        );
+
+        assert_eq!(
+            too_long_count.get(),
+            1,
+            "on_too_long must be called exactly once"
+        );
+        assert_eq!(silence_count.get(), 0, "on_silence must not be called");
+        assert!(
+            signals.auto_stopped.load(Ordering::Relaxed),
+            "auto_stopped signal must be set"
+        );
+        assert_eq!(
+            samples.len(),
+            max_samples,
+            "returned samples must equal cfg.max_samples()"
+        );
+    }
+
+    #[test]
+    fn au_big_endian_speech_then_silence_auto_stops() {
+        use std::cell::Cell;
+
+        let mut cfg = test_audio_config();
+        cfg.silence_timeout_ms = 160;
+
+        let mut stream = make_au_header(true, 24);
+        for _ in 0..800 {
+            stream.extend_from_slice(&10000i16.to_be_bytes());
+        }
+        for _ in 0..1280 {
+            stream.extend_from_slice(&10000i16.to_be_bytes());
+        }
+        for _ in 0..3000 {
+            stream.extend_from_slice(&0i16.to_be_bytes());
+        }
+
+        let signals = Signals::default();
+        let too_long_count = Cell::new(0usize);
+        let silence_count = Cell::new(0usize);
+
+        let _samples = read_loop(
+            &stream[..],
+            &cfg,
+            signals.clone(),
+            |_| {},
+            || too_long_count.set(too_long_count.get() + 1),
+            || silence_count.set(silence_count.get() + 1),
+        );
+
+        assert_eq!(
+            silence_count.get(),
+            1,
+            "on_silence must be called exactly once"
+        );
+        assert_eq!(too_long_count.get(), 0, "on_too_long must not be called");
+        assert!(
+            signals.speech_heard.load(Ordering::Relaxed),
+            "speech_heard must be true"
+        );
+        assert!(
+            !signals.auto_stopped.load(Ordering::Relaxed),
+            "auto_stopped must not be set on silence stop"
+        );
     }
 }
